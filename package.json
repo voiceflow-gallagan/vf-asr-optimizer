@@ -2,6 +2,7 @@
   "name": "vf-anthropic-optimizer",
   "version": "1.0.0",
   "type": "module",
+  "main": "index.ts",
   "scripts": {
     "start": "bun run index.ts"
   },
@@ -12,6 +13,6 @@
     "@anthropic-ai/sdk": "^0.32.1"
   },
   "devDependencies": {
-    "bun-types": "^1.1.38"
+    "@types/bun": "latest"
   }
 }
