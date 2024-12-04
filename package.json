@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start": "bun index.ts"
+    "start": "bun run index.ts"
   },
   "peerDependencies": {
     "typescript": "^5.0.0"
