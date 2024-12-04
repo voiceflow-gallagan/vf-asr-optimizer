@@ -146,7 +146,7 @@ IMPORTANT: Your response must be a valid JSON object with exactly these fields:
 }
 
 const server = serve({
-    port: 3000,
+    port: Bun.env.PORT || 3000,
     async fetch(req) {
         const url = new URL(req.url);
 
