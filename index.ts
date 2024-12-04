@@ -1,7 +1,19 @@
 import { serve, fetch } from "bun";
 import Anthropic from '@anthropic-ai/sdk';
+import { Database } from 'bun:sqlite';
 
 console.log("Starting server...");
+
+// Initialize SQLite database
+const db = new Database('optimization_results.db');
+db.run(`CREATE TABLE IF NOT EXISTS optimization_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    result TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    status TEXT DEFAULT 'pending'
+)`);
 
 interface Conversation {
     user_queries: string[];
@@ -25,6 +37,26 @@ interface OptimizeRequest {
     userID: string;
     vfApiKey: string;
     splitByLaunch?: boolean;
+}
+
+interface OptimizationResult {
+    id: number;
+    user_id: string;
+    project_id: string;
+    result: string;  // Store as string in DB
+    created_at: string;
+    status: 'pending' | 'completed' | 'error';
+}
+
+interface ParsedOptimizationResult extends Omit<OptimizationResult, 'result'> {
+    result: OptimizationResponse | { error: string } | { status: string };
+}
+
+function formatUserID(userID: string): string {
+    return userID
+        .replace(/\s/g, '+')  // Replace spaces with +
+        .replace(/\+$/, '')   // Remove trailing +
+        .replace(/^([^+])/, '+$1'); // Add + prefix if missing
 }
 
 function processTranscripts(transcripts: any[], splitByLaunch: boolean = true): ProcessedData {
@@ -78,6 +110,9 @@ async function analyzeWithClaude(data: ProcessedData): Promise<OptimizationRespo
         apiKey: Bun.env.ANTHROPIC_API_KEY || '',
     });
 
+    console.log("Analyzing with Claude...");
+    console.log(data);
+
     const prompt = `Your goal is to analyze previous phone conversation with ASR debug traces to find the optimal settings to set the followings options:
 
 - (ASR) Silence Wait: How much audio silence to wait before resolving, not effective in noisy environments.
@@ -85,7 +120,7 @@ async function analyzeWithClaude(data: ProcessedData): Promise<OptimizationRespo
 - (ASR) Punctuation Wait: How long to wait after a full sentence with punctuation is transcribed.
 - (ASR) No Punctuation Wait: How long to wait if there is transcription, but no final punctuation.
 
-All values for these settings are in MS and the current config is:
+All values for these settings are in MS and the default config is:
 
 - (ASR) Silence Wait: 500 MS
 - (ASR) Utterance End: 1500 MS
@@ -94,7 +129,10 @@ All values for these settings are in MS and the current config is:
 
 Now, based on the following logs, please provide the optimal settings with a summary to justify your choices:
 
+<logs>
 ${JSON.stringify(data, null, 2)}
+</logs>
+
 
 IMPORTANT: Your response must be a valid JSON object with exactly these fields:
 {
@@ -113,35 +151,77 @@ IMPORTANT: Your response must be a valid JSON object with exactly these fields:
         system: "You are a JSON-only response bot. You must respond with valid JSON that matches the schema specified in the prompt."
     });
 
+    const content = message.content[0].type === 'text'
+        ? message.content[0].text
+        : JSON.stringify(message.content[0]);
+
+    const jsonStartIndex = content.indexOf('{');
+    const jsonEndIndex = content.lastIndexOf('}') + 1;
+    const jsonString = content.substring(jsonStartIndex, jsonEndIndex);
+
+    return JSON.parse(jsonString.trim());
+}
+
+async function processOptimization(userID: string, projectID: string, vfApiKey: string, splitByLaunch: boolean) {
     try {
-        const content = message.content[0].type === 'text'
-            ? message.content[0].text
-            : JSON.stringify(message.content[0]);
-        console.log("Claude response:", content);
+        // First, fetch the list of transcripts to find the matching sessionID
+        const transcriptsListUrl = `https://api.voiceflow.com/v2/transcripts/${projectID}?range=Last%207%20Days`;
+        console.log("Fetching transcripts list from:", transcriptsListUrl);
 
-        // Extract JSON object from the response
-        const jsonStartIndex = content.indexOf('{');
-        const jsonEndIndex = content.lastIndexOf('}') + 1;
-        const jsonString = content.substring(jsonStartIndex, jsonEndIndex);
+        const listResponse = await fetch(transcriptsListUrl, {
+            headers: {
+                Authorization: vfApiKey,
+                'Content-Type': 'application/json'
+            }
+        });
 
-        const parsed = JSON.parse(jsonString.trim());
-
-        if (!parsed.analysis ||
-            typeof parsed.silence_wait !== 'number' ||
-            typeof parsed.utterance_end !== 'number' ||
-            typeof parsed.punctuation_wait !== 'number' ||
-            typeof parsed.no_punctuation_wait !== 'number') {
-            throw new Error('Response missing required fields');
+        if (!listResponse.ok) {
+            throw new Error(`Failed to fetch transcripts list: ${await listResponse.text()}`);
         }
 
-        return parsed as OptimizationResponse;
+        const transcriptsList = await listResponse.json();
+        const matchingTranscript = transcriptsList.find((t: any) => t.sessionID === userID);
+
+        if (!matchingTranscript) {
+            throw new Error(`No transcript found for userID: ${userID}`);
+        }
+
+        const transcriptID = matchingTranscript._id;
+        const transcriptsUrl = `https://api.voiceflow.com/v2/transcripts/${projectID}/${transcriptID}`;
+
+        const response = await fetch(transcriptsUrl, {
+            headers: {
+                Authorization: vfApiKey,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch transcripts: ${await response.text()}`);
+        }
+
+        const transcripts = await response.json();
+        const processedData = processTranscripts(transcripts, splitByLaunch);
+        const optimization = await analyzeWithClaude(processedData);
+
+        // Update or insert the result
+        db.run(
+            `INSERT OR REPLACE INTO optimization_results (user_id, project_id, result, status)
+             VALUES (?, ?, ?, ?)`,
+            [userID, projectID, JSON.stringify(optimization), 'completed']
+        );
+
+        return optimization;
     } catch (error) {
-        console.error("Parse error:", error);
-        const content = message.content[0].type === 'text'
-            ? message.content[0].text
-            : JSON.stringify(message.content[0]);
-        console.error("Raw response:", content);
-        throw new Error(`Failed to parse Claude response as JSON: ${error.message}`);
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+
+        // Update or insert the error result
+        db.run(
+            `INSERT OR REPLACE INTO optimization_results (user_id, project_id, result, status)
+             VALUES (?, ?, ?, ?)`,
+            [userID, projectID, JSON.stringify({ error: errorMessage }), 'error']
+        );
+        throw error;
     }
 }
 
@@ -149,6 +229,43 @@ const server = serve({
     port: Bun.env.PORT || 3000,
     async fetch(req) {
         const url = new URL(req.url);
+
+        // New endpoint to fetch results
+        if (url.pathname === "/results" && req.method === "GET") {
+            const rawUserID = url.searchParams.get("userID");
+            if (!rawUserID) {
+                return new Response("userID is required as a query parameter", {
+                    status: 400,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+
+            const userID = formatUserID(rawUserID);
+            console.log("Fetching results for userID:", userID);
+
+            // Get the record
+            const result = db.query<OptimizationResult, string>(
+                "SELECT * FROM optimization_results WHERE user_id = ?"
+            ).get(userID);
+
+            if (!result) {
+                return new Response(JSON.stringify({ error: "No results found" }), {
+                    status: 404,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+
+            // Parse the JSON string in result
+            const parsedResult: ParsedOptimizationResult = {
+                ...result,
+                result: JSON.parse(result.result)
+            };
+
+            console.log("Found result:", parsedResult);
+            return new Response(JSON.stringify(parsedResult), {
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
 
         if (url.pathname === "/optimize" && req.method === "POST") {
             console.log("Received POST request to /optimize");
@@ -168,84 +285,33 @@ const server = serve({
                     return new Response("ANTHROPIC_API_KEY environment variable is required", { status: 500 });
                 }
 
-                // Clean and decode the userID to handle '+' in phone numbers
-                const userID = encodedUserID
-                    .replace(/\s/g, '+')  // Replace spaces with +
-                    .replace(/\+$/, '')   // Remove trailing + if present
-                    .replace(/^([^+])/, '+$1'); // Add + prefix if missing
+                // Clean and decode the userID
+                const userID = formatUserID(encodedUserID);
+                console.log("Processing request for userID:", userID);
 
-                console.log("Original userID:", encodedUserID);
-                console.log("Processed userID:", userID);
+                // Update or insert initial pending record
+                db.run(
+                    `INSERT OR REPLACE INTO optimization_results (user_id, project_id, result, status)
+                     VALUES (?, ?, ?, ?)`,
+                    [userID, projectID, JSON.stringify({ status: "processing" }), "pending"]
+                );
 
-                try {
-                    // First, fetch the list of transcripts to find the matching sessionID
-                    const transcriptsListUrl = `https://api.voiceflow.com/v2/transcripts/${projectID}?range=Last%207%20Days`;
-                    console.log("Fetching transcripts list from:", transcriptsListUrl);
+                // Run the optimization process
+                processOptimization(userID, projectID, vfApiKey, splitByLaunch).catch(error => {
+                    console.error("Optimization error:", error);
+                });
 
-                    const listResponse = await fetch(transcriptsListUrl, {
-                        headers: {
-                            Authorization: vfApiKey,
-                            'Content-Type': 'application/json'
-                        }
-                    });
-
-                    if (!listResponse.ok) {
-                        const errorText = await listResponse.text();
-                        console.error("Voiceflow API error:", errorText);
-                        return new Response(`Failed to fetch transcripts list: ${errorText}`, {
-                            status: listResponse.status,
-                            headers: { 'Content-Type': 'application/json' }
-                        });
-                    }
-
-                    const transcriptsList = await listResponse.json();
-                    const matchingTranscript = transcriptsList.find((t: any) => t.sessionID === userID);
-
-                    if (!matchingTranscript) {
-                        return new Response(`No transcript found for userID: ${userID}`, {
-                            status: 404,
-                            headers: { 'Content-Type': 'application/json' }
-                        });
-                    }
-
-                    const transcriptID = matchingTranscript._id;
-                    const transcriptsUrl = `https://api.voiceflow.com/v2/transcripts/${projectID}/${transcriptID}`;
-                    console.log("Fetching transcript details from:", transcriptsUrl);
-
-                    const response = await fetch(transcriptsUrl, {
-                        headers: {
-                            Authorization: vfApiKey,
-                            'Content-Type': 'application/json'
-                        }
-                    });
-
-                    if (!response.ok) {
-                        const errorText = await response.text();
-                        console.error("Voiceflow API error:", errorText);
-                        return new Response(`Failed to fetch transcripts: ${errorText}`, {
-                            status: response.status,
-                            headers: { 'Content-Type': 'application/json' }
-                        });
-                    }
-
-                    const transcripts = await response.json();
-                    //const splitByLaunch = url.searchParams.get("splitByLaunch") !== "false";
-                    const processedData = processTranscripts(transcripts, splitByLaunch);
-                    const optimization = await analyzeWithClaude(processedData);
-
-                    return new Response(JSON.stringify(optimization), {
-                        headers: { "Content-Type": "application/json" }
-                    });
-                } catch (error) {
-                    console.error("Server error:", error);
-                    return new Response(JSON.stringify({ error: error.message }), {
-                        status: 500,
-                        headers: { 'Content-Type': 'application/json' }
-                    });
-                }
+                return new Response(JSON.stringify({
+                    message: "Optimization started",
+                    userID: userID
+                }), {
+                    status: 202,
+                    headers: { 'Content-Type': 'application/json' }
+                });
             } catch (error) {
-                console.error("Request error:", error);
-                return new Response(JSON.stringify({ error: error.message }), {
+                const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+                console.error("Request error:", errorMessage);
+                return new Response(JSON.stringify({ error: errorMessage }), {
                     status: 400,
                     headers: { 'Content-Type': 'application/json' }
                 });
