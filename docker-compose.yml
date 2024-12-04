@@ -1,0 +1,11 @@
+services:
+  vf-asr-optimizer:
+    build: .
+    ports:
+      - "${PORT}:${PORT}"
+    environment:
+      - NODE_ENV=${NODE_ENV}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - PORT=${PORT}
+    volumes:
+      - .:/app
