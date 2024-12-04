@@ -7,5 +7,6 @@ services:
       - NODE_ENV=${NODE_ENV}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - PORT=${PORT}
+      - DB_PATH=/usr/src/app/data/optimization_results.db
     volumes:
       - .:/app

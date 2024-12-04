@@ -1,12 +1,36 @@
 import { serve, fetch } from "bun";
 import Anthropic from '@anthropic-ai/sdk';
 import { Database } from 'bun:sqlite';
+import { mkdir } from "node:fs/promises";
 
 console.log("Starting server...");
 
-// Initialize SQLite database
-const db = new Database('optimization_results.db');
-db.run(`CREATE TABLE IF NOT EXISTS optimization_results (
+
+// Initialize database
+const DB_PATH = Bun.env.DB_PATH || './data/optimization_results.db';
+const DB_DIR = DB_PATH.substring(0, DB_PATH.lastIndexOf('/'));
+
+let db: Database;
+
+try {
+  // Check if database file exists
+  if (await Bun.file(DB_PATH).exists()) {
+    console.log('Database file exists')
+  } else {
+    console.log('Database file does not exist')
+    // Create directory if it doesn't exist
+    if (!await Bun.file(DB_DIR).exists()) {
+      try {
+        await mkdir(DB_DIR, { recursive: true });
+      } catch (mkdirError) {
+        console.error('Failed to create database directory:', mkdirError);
+        process.exit(1);
+      }
+    }
+  }
+
+  db = new Database(DB_PATH);
+  db.run(`CREATE TABLE IF NOT EXISTS optimization_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
     project_id TEXT NOT NULL,
@@ -14,6 +38,12 @@ db.run(`CREATE TABLE IF NOT EXISTS optimization_results (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     status TEXT DEFAULT 'pending'
 )`);
+  console.log('Database initialized successfully');
+} catch (dbError) {
+  console.error('Failed to initialize database:', dbError);
+  process.exit(1);
+}
+
 
 interface Conversation {
     user_queries: string[];
