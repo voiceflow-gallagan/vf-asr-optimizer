@@ -1,4 +1,13 @@
 {
+  "name": "vf-anthropic-optimizer",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun index.ts"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1"
   },
