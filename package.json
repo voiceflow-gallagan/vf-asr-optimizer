@@ -2,7 +2,7 @@
   "name": "vf-anthropic-optimizer",
   "version": "1.0.0",
   "type": "module",
-  "main": "index.ts",
+  "module": "index.ts",
   "scripts": {
     "start": "bun run index.ts"
   },
