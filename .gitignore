@@ -1,6 +1,7 @@
 # Dependencies
 node_modules/
-data/optimization_results.db
+data/optimization_results.*
+
 # Environment
 .env
 .env.*

@@ -10,39 +10,61 @@ console.log("Starting server...");
 const DB_PATH = Bun.env.DB_PATH || './data/optimization_results.db';
 const DB_DIR = DB_PATH.substring(0, DB_PATH.lastIndexOf('/'));
 
-let db: Database;
+let db: Database | undefined;
 
 try {
-  // Check if database file exists
-  if (await Bun.file(DB_PATH).exists()) {
-    console.log('Database file exists')
-  } else {
-    console.log('Database file does not exist')
-    // Create directory if it doesn't exist
+    // Check if database path exists
+    console.log('Checking database path:', DB_PATH);
     if (!await Bun.file(DB_DIR).exists()) {
-      try {
+        console.log('Creating database directory:', DB_DIR);
         await mkdir(DB_DIR, { recursive: true });
-      } catch (mkdirError) {
-        console.error('Failed to create database directory:', mkdirError);
-        process.exit(1);
-      }
+        // Ensure directory has proper permissions
+        await Bun.write(DB_DIR + '/.keep', '');
+        console.log('Database directory created successfully');
     }
-  }
 
-  db = new Database(DB_PATH);
-  db.run(`CREATE TABLE IF NOT EXISTS optimization_results (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    project_id TEXT NOT NULL,
-    result TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    status TEXT DEFAULT 'pending'
-)`);
-  console.log('Database initialized successfully');
+    console.log('Initializing database connection...');
+    db = new Database(DB_PATH, { create: true });
+
+    // Configure database settings
+    console.log('Configuring database settings...');
+    db.run('PRAGMA journal_mode = WAL');
+    db.run('PRAGMA synchronous = NORMAL');
+    console.log('Database write mode configured');
+
+    console.log('Creating table if not exists...');
+    db.run(`CREATE TABLE IF NOT EXISTS optimization_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        result TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        status TEXT DEFAULT 'pending'
+    )`);
+    console.log('Database initialized successfully');
 } catch (dbError) {
-  console.error('Failed to initialize database:', dbError);
-  process.exit(1);
+    console.error('Failed to initialize database:', dbError);
+    if (db) {
+        db.close();
+    }
+    process.exit(1);
 }
+
+// Add process cleanup
+process.on('exit', () => {
+    if (db) {
+        console.log('Closing database connection on exit');
+        db.close();
+    }
+});
+
+process.on('SIGINT', () => {
+    if (db) {
+        console.log('Closing database connection on SIGINT');
+        db.close();
+    }
+    process.exit(0);
+});
 
 
 interface Conversation {
@@ -175,9 +197,9 @@ IMPORTANT: Your response must be a valid JSON object with exactly these fields:
 
     const message = await anthropic.messages.create({
         model: 'claude-3-sonnet-20240229',
-        max_tokens: 1024,
+        max_tokens: 2024,
         messages: [{ role: 'user', content: prompt }],
-        temperature: 0.5,
+        temperature: 0.1,
         system: "You are a JSON-only response bot. You must respond with valid JSON that matches the schema specified in the prompt."
     });
 
@@ -193,6 +215,10 @@ IMPORTANT: Your response must be a valid JSON object with exactly these fields:
 }
 
 async function processOptimization(userID: string, projectID: string, vfApiKey: string, splitByLaunch: boolean) {
+    if (!db) {
+        throw new Error('Database not initialized');
+    }
+
     try {
         // First, fetch the list of transcripts to find the matching sessionID
         const transcriptsListUrl = `https://api.voiceflow.com/v2/transcripts/${projectID}?range=Last%207%20Days`;
@@ -234,23 +260,49 @@ async function processOptimization(userID: string, projectID: string, vfApiKey: 
         const processedData = processTranscripts(transcripts, splitByLaunch);
         const optimization = await analyzeWithClaude(processedData);
 
-        // Update or insert the result
-        db.run(
-            `INSERT OR REPLACE INTO optimization_results (user_id, project_id, result, status)
-             VALUES (?, ?, ?, ?)`,
-            [userID, projectID, JSON.stringify(optimization), 'completed']
+        console.log('Starting database update...');
+
+        // Update the result directly without transaction
+        const updateResult = db.run(
+            `UPDATE optimization_results
+             SET result = ?, status = ?
+             WHERE user_id = ? AND project_id = ?`,
+            [JSON.stringify(optimization), 'completed', userID, projectID]
         );
 
+        console.log('Database update result:', updateResult);
+
+        // Verify the update
+        const verifyResult = db.query<OptimizationResult>(
+            'SELECT * FROM optimization_results WHERE user_id = ? AND project_id = ?'
+        ).get(userID, projectID);
+
+        console.log('Verification query result:', verifyResult);
+
+        if (!verifyResult || verifyResult.status !== 'completed') {
+            throw new Error('Failed to verify database update');
+        }
+
+        console.log('Database update completed successfully');
         return optimization;
     } catch (error) {
+        console.error('Error in processOptimization:', error);
         const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
 
-        // Update or insert the error result
-        db.run(
-            `INSERT OR REPLACE INTO optimization_results (user_id, project_id, result, status)
-             VALUES (?, ?, ?, ?)`,
-            [userID, projectID, JSON.stringify({ error: errorMessage }), 'error']
-        );
+        if (db) {
+            try {
+                console.log('Updating error status...');
+                const errorResult = db.run(
+                    `UPDATE optimization_results
+                     SET result = ?, status = ?
+                     WHERE user_id = ? AND project_id = ?`,
+                    [JSON.stringify({ error: errorMessage }), 'error', userID, projectID]
+                );
+                console.log('Error status update result:', errorResult);
+            } catch (dbError) {
+                console.error('Failed to update error status:', dbError);
+            }
+        }
         throw error;
     }
 }
@@ -320,16 +372,41 @@ const server = serve({
                 console.log("Processing request for userID:", userID);
 
                 // Update or insert initial pending record
-                db.run(
-                    `INSERT OR REPLACE INTO optimization_results (user_id, project_id, result, status)
-                     VALUES (?, ?, ?, ?)`,
-                    [userID, projectID, JSON.stringify({ status: "processing" }), "pending"]
-                );
+                try {
+                    db.run(
+                        `INSERT OR REPLACE INTO optimization_results (user_id, project_id, result, status)
+                         VALUES (?, ?, ?, ?)`,
+                        [userID, projectID, JSON.stringify({ status: "processing" }), "pending"]
+                    );
+                } catch (dbError) {
+                    console.error("Database error:", dbError);
+                    return new Response(JSON.stringify({ error: "Failed to initialize optimization record" }), {
+                        status: 500,
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                }
 
-                // Run the optimization process
-                processOptimization(userID, projectID, vfApiKey, splitByLaunch).catch(error => {
-                    console.error("Optimization error:", error);
-                });
+                // Run the optimization process in the background
+                (async () => {
+                    try {
+                        console.log(`Starting background optimization for userID: ${userID}`);
+                        const result = await processOptimization(userID, projectID, vfApiKey, splitByLaunch);
+                        console.log(`Optimization completed successfully for userID: ${userID}`, result);
+                    } catch (error) {
+                        console.error(`Optimization error for userID: ${userID}:`, error);
+                        try {
+                            console.log(`Updating database with error status for userID: ${userID}`);
+                            db.run(
+                                `INSERT OR REPLACE INTO optimization_results (user_id, project_id, result, status)
+                                 VALUES (?, ?, ?, ?)`,
+                                [userID, projectID, JSON.stringify({ error: error instanceof Error ? error.message : 'Unknown error occurred' }), "error"]
+                            );
+                            console.log(`Successfully updated error status for userID: ${userID}`);
+                        } catch (dbError) {
+                            console.error(`Failed to update error status for userID: ${userID}:`, dbError);
+                        }
+                    }
+                })();
 
                 return new Response(JSON.stringify({
                     message: "Optimization started",
