@@ -2,7 +2,6 @@ import { serve, fetch } from "bun";
 import Anthropic from '@anthropic-ai/sdk';
 
 console.log("Starting server...");
-console.log("ANTHROPIC_API_KEY:", Bun.env.ANTHROPIC_API_KEY);
 
 interface Conversation {
     user_queries: string[];
