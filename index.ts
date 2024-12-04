@@ -21,6 +21,13 @@ interface OptimizationResponse {
     no_punctuation_wait: number;
 }
 
+interface OptimizeRequest {
+    projectID: string;
+    userID: string;
+    vfApiKey: string;
+    splitByLaunch?: boolean;
+}
+
 function processTranscripts(transcripts: any[], splitByLaunch: boolean = true): ProcessedData {
     let conversations: Conversation[] = [];
     let currentConversation: Conversation = { user_queries: [], asr_traces: [] };
@@ -144,99 +151,103 @@ const server = serve({
     async fetch(req) {
         const url = new URL(req.url);
 
-        if (url.pathname === "/optimize") {
-            console.log("Received request to /optimize");
-
-            const authHeader = req.headers.get("Authorization");
-            console.log("Auth header:", authHeader);
-
-            if (!authHeader) {
-                return new Response("Authorization header is required", { status: 401 });
-            }
-
-            if (!process.env.ANTHROPIC_API_KEY) {
-                return new Response("ANTHROPIC_API_KEY environment variable is required", { status: 500 });
-            }
-
-            const projectID = url.searchParams.get("projectID");
-            const encodedUserID = url.searchParams.get("userID");
-
-            if (!projectID || !encodedUserID) {
-                return new Response("projectID and userID are required query parameters", { status: 400 });
-            }
-
-            // Clean and decode the userID to handle '+' in phone numbers
-            const userID = encodedUserID
-                .replace(/\s/g, '+')  // Replace spaces with +
-                .replace(/\+$/, '')   // Remove trailing + if present (from curl)
-                .replace(/^([^+])/, '+$1'); // Add + prefix if missing
-
-            console.log("Original userID param:", encodedUserID);
-            console.log("Processed userID:", userID);
+        if (url.pathname === "/optimize" && req.method === "POST") {
+            console.log("Received POST request to /optimize");
 
             try {
-                // First, fetch the list of transcripts to find the matching sessionID
-                const transcriptsListUrl = `https://api.voiceflow.com/v2/transcripts/${projectID}?range=Last%207%20Days`;
-                console.log("Fetching transcripts list from:", transcriptsListUrl);
+                const body = await req.json() as OptimizeRequest;
+                const { projectID, userID: encodedUserID, vfApiKey, splitByLaunch = true } = body;
 
-                const listResponse = await fetch(transcriptsListUrl, {
-                    headers: {
-                        Authorization: authHeader,
-                        'Content-Type': 'application/json'
+                if (!projectID || !encodedUserID || !vfApiKey) {
+                    return new Response("projectID, userID, and vfApiKey are required in request body", {
+                        status: 400,
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                }
+
+                if (!process.env.ANTHROPIC_API_KEY) {
+                    return new Response("ANTHROPIC_API_KEY environment variable is required", { status: 500 });
+                }
+
+                // Clean and decode the userID to handle '+' in phone numbers
+                const userID = encodedUserID
+                    .replace(/\s/g, '+')  // Replace spaces with +
+                    .replace(/\+$/, '')   // Remove trailing + if present
+                    .replace(/^([^+])/, '+$1'); // Add + prefix if missing
+
+                console.log("Original userID:", encodedUserID);
+                console.log("Processed userID:", userID);
+
+                try {
+                    // First, fetch the list of transcripts to find the matching sessionID
+                    const transcriptsListUrl = `https://api.voiceflow.com/v2/transcripts/${projectID}?range=Last%207%20Days`;
+                    console.log("Fetching transcripts list from:", transcriptsListUrl);
+
+                    const listResponse = await fetch(transcriptsListUrl, {
+                        headers: {
+                            Authorization: vfApiKey,
+                            'Content-Type': 'application/json'
+                        }
+                    });
+
+                    if (!listResponse.ok) {
+                        const errorText = await listResponse.text();
+                        console.error("Voiceflow API error:", errorText);
+                        return new Response(`Failed to fetch transcripts list: ${errorText}`, {
+                            status: listResponse.status,
+                            headers: { 'Content-Type': 'application/json' }
+                        });
                     }
-                });
 
-                if (!listResponse.ok) {
-                    const errorText = await listResponse.text();
-                    console.error("Voiceflow API error:", errorText);
-                    return new Response(`Failed to fetch transcripts list: ${errorText}`, {
-                        status: listResponse.status,
-                        headers: { 'Content-Type': 'application/json' }
-                    });
-                }
+                    const transcriptsList = await listResponse.json();
+                    const matchingTranscript = transcriptsList.find((t: any) => t.sessionID === userID);
 
-                const transcriptsList = await listResponse.json();
-                const matchingTranscript = transcriptsList.find((t: any) => t.sessionID === userID);
-
-                if (!matchingTranscript) {
-                    return new Response(`No transcript found for userID: ${userID}`, {
-                        status: 404,
-                        headers: { 'Content-Type': 'application/json' }
-                    });
-                }
-
-                const transcriptID = matchingTranscript._id;
-                const transcriptsUrl = `https://api.voiceflow.com/v2/transcripts/${projectID}/${transcriptID}`;
-                console.log("Fetching transcript details from:", transcriptsUrl);
-
-                const response = await fetch(transcriptsUrl, {
-                    headers: {
-                        Authorization: authHeader,
-                        'Content-Type': 'application/json'
+                    if (!matchingTranscript) {
+                        return new Response(`No transcript found for userID: ${userID}`, {
+                            status: 404,
+                            headers: { 'Content-Type': 'application/json' }
+                        });
                     }
-                });
 
-                if (!response.ok) {
-                    const errorText = await response.text();
-                    console.error("Voiceflow API error:", errorText);
-                    return new Response(`Failed to fetch transcripts: ${errorText}`, {
-                        status: response.status,
+                    const transcriptID = matchingTranscript._id;
+                    const transcriptsUrl = `https://api.voiceflow.com/v2/transcripts/${projectID}/${transcriptID}`;
+                    console.log("Fetching transcript details from:", transcriptsUrl);
+
+                    const response = await fetch(transcriptsUrl, {
+                        headers: {
+                            Authorization: vfApiKey,
+                            'Content-Type': 'application/json'
+                        }
+                    });
+
+                    if (!response.ok) {
+                        const errorText = await response.text();
+                        console.error("Voiceflow API error:", errorText);
+                        return new Response(`Failed to fetch transcripts: ${errorText}`, {
+                            status: response.status,
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+                    }
+
+                    const transcripts = await response.json();
+                    //const splitByLaunch = url.searchParams.get("splitByLaunch") !== "false";
+                    const processedData = processTranscripts(transcripts, splitByLaunch);
+                    const optimization = await analyzeWithClaude(processedData);
+
+                    return new Response(JSON.stringify(optimization), {
+                        headers: { "Content-Type": "application/json" }
+                    });
+                } catch (error) {
+                    console.error("Server error:", error);
+                    return new Response(JSON.stringify({ error: error.message }), {
+                        status: 500,
                         headers: { 'Content-Type': 'application/json' }
                     });
                 }
-
-                const transcripts = await response.json();
-                const splitByLaunch = url.searchParams.get("splitByLaunch") !== "false";
-                const processedData = processTranscripts(transcripts, splitByLaunch);
-                const optimization = await analyzeWithClaude(processedData);
-
-                return new Response(JSON.stringify(optimization), {
-                    headers: { "Content-Type": "application/json" }
-                });
             } catch (error) {
-                console.error("Server error:", error);
+                console.error("Request error:", error);
                 return new Response(JSON.stringify({ error: error.message }), {
-                    status: 500,
+                    status: 400,
                     headers: { 'Content-Type': 'application/json' }
                 });
             }
